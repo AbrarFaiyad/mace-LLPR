@@ -115,6 +115,8 @@ class MACECalculator(Calculator):
         pad_num_atoms: int = 0,
         pad_num_edges: int = 0,
         warmup: bool = False,
+        llpr_cache_path: Union[str, Path, None] = None,
+        llpr_hook_layer: str = "pre_last",
         **kwargs,
     ):
         Calculator.__init__(self, **kwargs)
@@ -389,6 +391,56 @@ class MACECalculator(Calculator):
 
         if warmup and self.use_compile:
             logging.info("Warmup requested -- will trigger on first calculate() call")
+
+        # -----------------------------------------------------------------
+        # Optional LLPR (Last-Layer Posterior Regression) uncertainty.
+        # Strictly additive: when llpr_cache_path is None, no hook is
+        # attached and the calculator behaves identically to upstream.
+        # -----------------------------------------------------------------
+        self._llpr_cache = None
+        self._llpr_extractor = None
+        self._llpr_hook_layer = llpr_hook_layer
+        if llpr_cache_path is not None:
+            if self.num_models > 1:
+                raise NotImplementedError(
+                    "LLPR uncertainty is per-model; committee mode "
+                    "(num_models > 1) is not supported. Build separate "
+                    "caches per model or use the first model only."
+                )
+            try:
+                # local imports to avoid cyclic / import-time cost when LLPR unused
+                from mace.modules.llpr import LLPRCache as _LLPRCache
+                from mace.tools.llpr_features import (
+                    LastLayerFeatureExtractor as _LLPRExtractor,
+                )
+            except ImportError as exc:
+                raise ImportError(
+                    "LLPR support requires mace.modules.llpr + mace.tools.llpr_features "
+                    "(both ship with this MACE branch). Original error: " + str(exc)
+                ) from exc
+            self._llpr_cache = _LLPRCache.load(llpr_cache_path, device=self.device)
+            self._llpr_extractor = _LLPRExtractor(
+                self.models[0], hook_layer=llpr_hook_layer
+            )
+            if self._llpr_extractor.d != self._llpr_cache.d:
+                raise ValueError(
+                    f"LLPR cache d={self._llpr_cache.d} does not match the "
+                    f"hooked layer d={self._llpr_extractor.d} for hook_layer="
+                    f"{llpr_hook_layer!r}. Did you build the cache against "
+                    "a different model architecture or hook_layer?"
+                )
+            self.implemented_properties.extend(
+                ["uncertainty", "max_atom_uncertainty"]
+            )
+            logging.info(
+                "LLPR enabled: cache=%s, d=%d, regularizer_sq=%.4g, "
+                "alpha_sq=%.4g, hook_layer=%s",
+                str(llpr_cache_path),
+                self._llpr_cache.d,
+                self._llpr_cache.regularizer_sq,
+                self._llpr_cache.alpha_sq,
+                llpr_hook_layer,
+            )
 
     def check_state(self, atoms, tol: float = 1e-15) -> list:
         """
@@ -731,6 +783,32 @@ class MACECalculator(Calculator):
                     for stress in self.results["stresses"]
                 ]
             )
+
+        # -----------------------------------------------------------------
+        # Optional LLPR uncertainty (per-atom Mahalanobis distance to the
+        # training feature cloud). Populated only when llpr_cache_path was
+        # supplied to __init__; otherwise this block is a no-op.
+        # The forward-pre-hook attached in __init__ has captured phi
+        # during the forward pass(es) above (model(batch_dict, ...) at
+        # line ~635). We just read the captured tensor and apply
+        # u = sqrt(alpha^2 * phi^T M^{-1} phi) via the cache.
+        # -----------------------------------------------------------------
+        if self._llpr_cache is not None and self._llpr_extractor is not None:
+            try:
+                phi = self._llpr_extractor.last_captured()
+                if is_padded:
+                    # The hook captured features for the padded batch; trim
+                    # to the real atoms in the requested system.
+                    phi = phi[:num_real_atoms]
+                u = self._llpr_cache.u_per_atom(phi).detach().cpu().numpy()
+                self.results["uncertainty"] = u
+                self.results["max_atom_uncertainty"] = float(u.max())
+            except Exception as exc:  # pylint: disable=broad-except
+                logging.warning(
+                    "LLPR uncertainty computation failed: %s; results dict "
+                    "will not contain 'uncertainty'.",
+                    exc,
+                )
 
     def get_dielectric_derivatives(self, atoms=None):
         if atoms is None and self.atoms is None:

@@ -486,3 +486,208 @@ def test_e2e_extractor_to_cache_to_u_per_atom():
     assert torch.all(torch.isfinite(u))
 
     extractor.remove()
+
+
+# -----------------------------------------------------------------------------
+# Session 3: MACECalculator integration tests
+# These require the bundled MACE-MP foundation model.
+# -----------------------------------------------------------------------------
+import os as _os
+from pathlib import Path as _Path
+
+_BUNDLED_MP = (
+    _Path(__file__).parent.parent
+    / "mace"
+    / "calculators"
+    / "foundations_models"
+    / "2023-12-03-mace-mp.model"
+)
+
+_HAS_MP = _BUNDLED_MP.exists()
+
+
+@pytest.mark.skipif(not _HAS_MP, reason="bundled MACE-MP foundation not present")
+def test_mace_calculator_without_llpr_is_unchanged():
+    """Backward-compat: no llpr_cache_path -> no uncertainty in results."""
+    from ase.build import bulk
+    from mace.calculators.mace import MACECalculator
+
+    loaded = torch.load(str(_BUNDLED_MP), map_location="cpu", weights_only=False)
+    calc = MACECalculator(models=[loaded], device="cpu", default_dtype="float64")
+    atoms = bulk("Si", cubic=True, a=5.43, crystalstructure="diamond")
+    atoms.calc = calc
+    atoms.get_potential_energy()
+    assert "uncertainty" not in calc.results
+    assert "max_atom_uncertainty" not in calc.results
+    assert "uncertainty" not in calc.implemented_properties
+    assert calc._llpr_cache is None
+    assert calc._llpr_extractor is None
+
+
+@pytest.mark.skipif(not _HAS_MP, reason="bundled MACE-MP foundation not present")
+def test_mace_calculator_with_llpr_returns_uncertainty(tmp_path):
+    """End-to-end: build cache from in-memory Si frames, load, verify u finite."""
+    from ase.build import bulk
+    from mace.calculators.mace import MACECalculator
+    from mace.modules.llpr import LLPRCache
+    from mace.tools.llpr_features import LastLayerFeatureExtractor
+
+    loaded = torch.load(str(_BUNDLED_MP), map_location="cpu", weights_only=False)
+
+    # build cache manually
+    calc_for_build = MACECalculator(
+        models=[loaded], device="cpu", default_dtype="float64"
+    )
+    extractor = LastLayerFeatureExtractor(
+        calc_for_build.models[0], hook_layer="pre_last"
+    )
+    cache = LLPRCache(d=extractor.d, device="cpu")
+    rng = np.random.RandomState(0)
+    for _ in range(10):
+        atoms = bulk("Si", cubic=True, a=5.43 + 0.05 * rng.randn(),
+                     crystalstructure="diamond")
+        atoms.rattle(stdev=0.05, seed=rng.randint(1 << 30))
+        batch = calc_for_build._atoms_to_batch(atoms).to_dict()
+        with torch.no_grad():
+            try:
+                calc_for_build.models[0](batch, compute_force=False)
+            except TypeError:
+                calc_for_build.models[0](batch)
+        cache.accumulate(extractor.last_captured().double())
+    cache.finalize(regularizer_sq=None)
+    cache_path = tmp_path / "test_cache.pt"
+    cache.save(cache_path)
+    extractor.remove()
+
+    # load fresh model + use cache via the calculator kwarg
+    loaded2 = torch.load(str(_BUNDLED_MP), map_location="cpu", weights_only=False)
+    calc = MACECalculator(
+        models=[loaded2],
+        device="cpu",
+        default_dtype="float64",
+        llpr_cache_path=str(cache_path),
+        llpr_hook_layer="pre_last",
+    )
+    assert "uncertainty" in calc.implemented_properties
+    assert "max_atom_uncertainty" in calc.implemented_properties
+    assert calc._llpr_cache is not None
+    assert calc._llpr_extractor is not None
+    assert calc._llpr_extractor.d == cache.d
+
+    atoms = bulk("Si", cubic=True, a=5.43, crystalstructure="diamond")
+    atoms.rattle(stdev=0.1)
+    atoms.calc = calc
+    atoms.get_potential_energy()
+    u = calc.results["uncertainty"]
+    assert u.shape == (len(atoms),)
+    assert np.all(np.isfinite(u))
+    assert np.all(u >= 0)
+    assert calc.results["max_atom_uncertainty"] == float(u.max())
+
+
+@pytest.mark.skipif(not _HAS_MP, reason="bundled MACE-MP foundation not present")
+def test_mace_calculator_llpr_matches_manual_path(tmp_path):
+    """The built-in calculator path must equal the manual hook+cache path."""
+    from ase.build import bulk
+    from mace.calculators.mace import MACECalculator
+    from mace.modules.llpr import LLPRCache
+    from mace.tools.llpr_features import LastLayerFeatureExtractor
+
+    loaded = torch.load(str(_BUNDLED_MP), map_location="cpu", weights_only=False)
+
+    # build cache
+    calc_for_build = MACECalculator(
+        models=[loaded], device="cpu", default_dtype="float64"
+    )
+    extractor = LastLayerFeatureExtractor(
+        calc_for_build.models[0], hook_layer="pre_last"
+    )
+    cache = LLPRCache(d=extractor.d, device="cpu")
+    for _ in range(8):
+        atoms = bulk("Si", cubic=True, a=5.43, crystalstructure="diamond")
+        atoms.rattle(stdev=0.05)
+        batch = calc_for_build._atoms_to_batch(atoms).to_dict()
+        with torch.no_grad():
+            try:
+                calc_for_build.models[0](batch, compute_force=False)
+            except TypeError:
+                calc_for_build.models[0](batch)
+        cache.accumulate(extractor.last_captured().double())
+    cache.finalize(regularizer_sq=1.0)
+    cache_path = tmp_path / "match_cache.pt"
+    cache.save(cache_path)
+    extractor.remove()
+
+    atoms = bulk("Si", cubic=True, a=5.43, crystalstructure="diamond")
+    atoms.rattle(stdev=0.15)
+
+    # Path A: built-in calculator
+    loaded_a = torch.load(str(_BUNDLED_MP), map_location="cpu", weights_only=False)
+    calc_a = MACECalculator(
+        models=[loaded_a],
+        device="cpu",
+        default_dtype="float64",
+        llpr_cache_path=str(cache_path),
+    )
+    atoms_a = atoms.copy()
+    atoms_a.calc = calc_a
+    atoms_a.get_potential_energy()
+    u_a = calc_a.results["uncertainty"]
+
+    # Path B: manual
+    loaded_b = torch.load(str(_BUNDLED_MP), map_location="cpu", weights_only=False)
+    calc_b = MACECalculator(models=[loaded_b], device="cpu", default_dtype="float64")
+    extr_b = LastLayerFeatureExtractor(calc_b.models[0], hook_layer="pre_last")
+    cache_b = LLPRCache.load(cache_path, device="cpu")
+    atoms_b = atoms.copy()
+    batch = calc_b._atoms_to_batch(atoms_b).to_dict()
+    with torch.no_grad():
+        try:
+            calc_b.models[0](batch, compute_force=False)
+        except TypeError:
+            calc_b.models[0](batch)
+    u_b = cache_b.u_per_atom(extr_b.last_captured()).numpy()
+    extr_b.remove()
+
+    assert np.allclose(u_a, u_b, atol=1e-10), (
+        f"built-in {u_a} != manual {u_b} (diff {np.abs(u_a - u_b).max():.4e})"
+    )
+
+
+@pytest.mark.skipif(not _HAS_MP, reason="bundled MACE-MP foundation not present")
+def test_mace_calculator_llpr_committee_raises():
+    """Committee mode + LLPR must raise NotImplementedError."""
+    from mace.calculators.mace import MACECalculator
+
+    loaded1 = torch.load(str(_BUNDLED_MP), map_location="cpu", weights_only=False)
+    loaded2 = torch.load(str(_BUNDLED_MP), map_location="cpu", weights_only=False)
+    with pytest.raises(NotImplementedError, match="committee"):
+        MACECalculator(
+            models=[loaded1, loaded2],
+            device="cpu",
+            default_dtype="float64",
+            llpr_cache_path="/nonexistent_path.pt",  # never reached
+        )
+
+
+@pytest.mark.skipif(not _HAS_MP, reason="bundled MACE-MP foundation not present")
+def test_mace_calculator_llpr_dim_mismatch_raises(tmp_path):
+    """Cache with wrong d should be rejected on construction."""
+    from mace.calculators.mace import MACECalculator
+    from mace.modules.llpr import LLPRCache
+
+    # Build a cache with d=999 (definitely doesn't match MACE-MP d=128)
+    fake_cache = LLPRCache(d=999, device="cpu")
+    fake_cache.accumulate(torch.randn(50, 999, dtype=torch.float64))
+    fake_cache.finalize(regularizer_sq=1.0)
+    cache_path = tmp_path / "wrong_d.pt"
+    fake_cache.save(cache_path)
+
+    loaded = torch.load(str(_BUNDLED_MP), map_location="cpu", weights_only=False)
+    with pytest.raises(ValueError, match="does not match"):
+        MACECalculator(
+            models=[loaded],
+            device="cpu",
+            default_dtype="float64",
+            llpr_cache_path=str(cache_path),
+        )
