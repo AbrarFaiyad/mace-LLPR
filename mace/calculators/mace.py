@@ -254,8 +254,28 @@ class MACECalculator(Calculator):
             model.to(device)
 
         if has_ipex and device == "xpu":
-            for model in self.models:
-                model = ipex.optimize(model)
+            # ipex.optimize defaults to TRAINING mode; for inference (the
+            # MACECalculator path), pass inplace=True + the model's dtype so
+            # ipex picks the inference code path and does not require an
+            # optimizer. Skip silently on failure -- ipex acceleration is
+            # optional. (Upstream MACE had `model = ipex.optimize(model)`
+            # which (a) failed on Aurora's ipex 2.10 with "optimizer should
+            # be given for training mode" and (b) discarded the return value
+            # because of local-variable shadowing.)
+            for idx, model in enumerate(self.models):
+                try:
+                    model.eval()
+                    optimized = ipex.optimize(
+                        model,
+                        dtype=next(model.parameters()).dtype,
+                        inplace=True,
+                    )
+                    self.models[idx] = optimized
+                except Exception as exc:  # pylint: disable=broad-except
+                    logging.warning(
+                        "ipex.optimize failed for model %d (%s); "
+                        "continuing without IPEX acceleration", idx, exc,
+                    )
 
         r_maxs = [model.r_max.cpu() for model in self.models]
         r_maxs = np.array(r_maxs)
