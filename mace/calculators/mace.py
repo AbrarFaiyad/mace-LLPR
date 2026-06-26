@@ -429,9 +429,12 @@ class MACECalculator(Calculator):
                     f"{llpr_hook_layer!r}. Did you build the cache against "
                     "a different model architecture or hook_layer?"
                 )
-            self.implemented_properties.extend(
-                ["uncertainty", "max_atom_uncertainty"]
-            )
+            # Use instance attr (copy) to avoid mutating the class-level list
+            # across multiple MACECalculator constructions in the same process.
+            self.implemented_properties = list(self.implemented_properties) + [
+                p for p in ("uncertainty", "max_atom_uncertainty")
+                if p not in self.implemented_properties
+            ]
             logging.info(
                 "LLPR enabled: cache=%s, d=%d, regularizer_sq=%.4g, "
                 "alpha_sq=%.4g, hook_layer=%s",

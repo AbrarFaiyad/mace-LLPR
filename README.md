@@ -335,6 +335,74 @@ mace_run_train \
 Other options are "medium" and "large", or the path to a foundation model.
 If you want to finetune another model, the model will be loaded from the path provided `--foundation_model=$path_model`, all the hypers will be extracted automatically.
 
+## LLPR Uncertainty Quantification
+
+This fork adds **Last-Layer Posterior Regression (LLPR)** uncertainty quantification as a first-class MACE feature, based on Bigi, Chong, Ceriotti & Grasselli, *MLST* **5**(4) 2024 ([arXiv:2403.02251](https://arxiv.org/abs/2403.02251)).
+
+LLPR gives per-atom Mahalanobis-distance uncertainty `u_i = sqrt(alpha^2 * phi_i^T (Phi^T Phi + sigma^2 * I)^{-1} phi_i)` at <1% per-step overhead compared to unbiased inference. Cache build is one-shot, ~15 sec for ~25k training atoms.
+
+### Workflow (3 steps)
+
+**1. Train your MACE model as usual:**
+```bash
+mace_run_train --name=my_model --train_file=train.xyz --valid_fraction=0.1 ...
+```
+
+**2. Build the LLPR cache** (one-shot, after training):
+```bash
+mace_build_llpr_cache \
+    --model my_model.model \
+    --train_file train.xyz \
+    --valid_file valid.xyz \
+    --output llpr_cache.pt \
+    --calibration spearman \
+    --hook_layer pre_last
+```
+Calibration modes:
+- `auto_pd`: no validation set needed; picks smallest stable regularizer
+- `spearman`: sweeps regularizer grid, maximizes rank correlation between predicted `u` and reference force error
+- `nll`: closed-form alpha from squared energy residuals (PET-MAD style)
+
+Hook layers:
+- `pre_last` (default): hooks `linear_1` input in NonLinearReadoutBlock (typically d=128, richer features)
+- `auto`: hooks the final linear input (d=16 for NonLinear, d=128 for Linear readout)
+
+**3. Use during inference** — pass `llpr_cache_path` to `MACECalculator`:
+```python
+from mace.calculators import MACECalculator
+from ase.io import read
+
+calc = MACECalculator(
+    model_paths="my_model.model",
+    device="cuda",
+    llpr_cache_path="llpr_cache.pt",  # NEW
+)
+atoms = read("test.xyz")
+atoms.calc = calc
+E = atoms.get_potential_energy()
+F = atoms.get_forces()
+u_per_atom = calc.results["uncertainty"]              # numpy array, shape (N_atoms,)
+u_max = calc.results["max_atom_uncertainty"]          # scalar (worst atom in frame)
+```
+
+When `llpr_cache_path=None` (default) or not provided, `MACECalculator` behaves identically to upstream — strictly additive.
+
+### Notes
+
+- Compatible with both `LinearReadoutBlock` and `NonLinearReadoutBlock` (auto-detected)
+- Compatible with foundation models (`mace_mp`, `mace_off`, MATPES, OMat24) — works on any MACE checkpoint
+- fp64 throughout cache + Cholesky factorization (no full-inverse) for numerical stability
+- Committee mode (multiple models) raises `NotImplementedError`; build a separate cache per model
+- For active learning, see [`examples/llpr_active_learning.py`](examples/llpr_active_learning.py)
+
+### Reference implementation
+
+- `mace/modules/llpr.py` — `LLPRCache` class (Cholesky + auto-PD + Spearman/NLL calibration)
+- `mace/tools/llpr_features.py` — `LastLayerFeatureExtractor` forward-hook helper
+- `mace/cli/build_llpr_cache.py` — CLI tool
+- `tests/test_llpr.py` — 39 unit + integration tests
+- `docs/LLPR_DESIGN.md` — full design rationale
+
 ## Caching
 
 By default automatically downloaded models, like mace_mp, mace_off and data for fine tuning, end up in `~/.cache/mace`. The path can be changed by using
