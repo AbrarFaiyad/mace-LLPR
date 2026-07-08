@@ -6,21 +6,25 @@
 # (For the LLPR pipeline venv used by Auto-Finetuner, use
 #  build_env_llpr_aurora.sh instead — that builds the mace-LLPR fork.)
 #
-# Creates /home/afaiyad/QuantumDS/venv_mace_rsga/ on top of the Aurora
-# py-torch/2.10.0 module (XPU-enabled). Installs the RSGA fork of mace
-# from https://github.com/GSLab2025/RSGA_MACE_OPT via --no-deps to avoid
+# Creates the RSGA training venv on top of the Aurora py-torch/2.10.0 module
+# (XPU-enabled). Installs the RSGA fork of mace via --no-deps to avoid
 # clobbering the Aurora-provided torch.
 #
 # After install we patch site-packages/mace/tools/distributed_tools.py so
 # that (a) the xpu code path uses the xccl backend (Aurora replaced
 # ccl with xccl), and (b) the mpi launcher also recognises Intel
 # MPI/PALS env vars (PMI_RANK, PALS_RANKID, PALS_LOCAL_SIZE).
+#
+# Paths are configurable via env vars; edit the defaults or export them:
+#   VENV_DIR      where the venv is created  (default: $HOME/venv_mace_rsga)
+#   RSGA_SRC_DIR  RSGA fork checkout         (default: $HOME/RSGA_MACE_OPT)
+#   RSGA_REPO     RSGA fork git URL
 
 set -e
 
-VENV_DIR="/home/afaiyad/QuantumDS/venv_mace_rsga"
-RSGA_SRC_DIR="/home/afaiyad/QuantumDS/RSGA_MACE_OPT"
-RSGA_REPO="https://github.com/GSLab2025/RSGA_MACE_OPT.git"
+VENV_DIR="${VENV_DIR:-$HOME/venv_mace_rsga}"
+RSGA_SRC_DIR="${RSGA_SRC_DIR:-$HOME/RSGA_MACE_OPT}"
+RSGA_REPO="${RSGA_REPO:-https://github.com/GSLab2025/RSGA_MACE_OPT.git}"
 
 echo "==> loading Aurora modules"
 module load py-torch/2.10.0

@@ -3,30 +3,33 @@
 #
 #   bash build_env_llpr_aurora.sh
 #
-# Creates venv_mace_lora_llpr on top of the Aurora frameworks/2025.3.1 module
-# (Python 3.12 + XPU torch 2.10 + native xccl). Installs our mace-LLPR fork
-# (https://github.com/AbrarFaiyad/mace-LLPR) editable + --no-deps so the
-# Aurora-provided torch/numpy/scipy are never clobbered, then applies the
-# Aurora XPU/PALS patches and the SOAP+FPS deps the frame assembler needs.
+# Creates the LLPR pipeline venv on top of the Aurora frameworks/2025.3.1 module
+# (Python 3.12 + XPU torch 2.10 + native xccl). Installs this mace-LLPR fork
+# editable + --no-deps so the Aurora-provided torch/numpy/scipy are never
+# clobbered, then applies the Aurora XPU/PALS patches and the SOAP+FPS deps the
+# frame assembler needs.
 #
-# This is the venv the Auto-Finetuner active-learning pipeline uses
-# (env_aurora.sh points VENV_PYTHON at it). For the separate RSGA training
-# venv, use build_rsga_env_aurora.sh instead.
+# For the separate RSGA training venv, use build_rsga_env_aurora.sh instead.
 #
-# Aurora adaptations applied (see AURORA_Intel/ in the fork for the reference
-# copies + README):
+# Aurora adaptations applied (see this AURORA_Intel/ dir README):
 #   1. distributed backend  ccl -> xccl   (Aurora renamed the Intel backend)
 #   2. mpi launcher accepts PMI_RANK / PALS_RANKID  (Aurora launches via PALS)
 #   3. ipex/oneccl imports made optional  (torch.xpu is native in torch 2.10)
 #   4. xpu.set_device / DDP device_ids guarded for 1-tile-per-rank
 #      (ZE_AFFINITY_MASK exposes a single tile, so device 0 is the only choice)
+#
+# Paths are configurable via env vars; edit the defaults or export them:
+#   VENV_DIR    where the venv is created   (default: $HOME/venv_mace_lora_llpr)
+#   LLPR_SRC_DIR  this fork checkout        (default: auto-detected from script)
 
 set -e
 
-VENV_DIR="/home/afaiyad/QuantumDS/afaiyad/venv_mace_lora_llpr"
-LLPR_SRC_DIR="/lus/flare/projects/QuantumDS/afaiyad/mace-LLPR-fork"
-LLPR_REPO="git@github.com:AbrarFaiyad/mace-LLPR.git"
-LLPR_BRANCH="main"
+# LLPR_SRC_DIR defaults to this fork's root (the parent of AURORA_Intel/).
+_SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+VENV_DIR="${VENV_DIR:-$HOME/venv_mace_lora_llpr}"
+LLPR_SRC_DIR="${LLPR_SRC_DIR:-$(cd "${_SCRIPT_DIR}/.." && pwd)}"
+LLPR_REPO="${LLPR_REPO:-https://github.com/AbrarFaiyad/mace-LLPR.git}"
+LLPR_BRANCH="${LLPR_BRANCH:-main}"
 
 echo "==> loading Aurora framework module"
 source /usr/share/lmod/lmod/init/bash 2>/dev/null || true
