@@ -85,6 +85,11 @@ class LoRAO3Linear(nn.Module):
         blocks = {}
         offset = 0
         for idx, instr in enumerate(linear.instructions):
+            # Bias instructions (i_in == -1) have a 1-tuple path_shape and are
+            # stored in linear.bias, not linear.weight. Skip them here so the
+            # weight-block offset cursor stays aligned with the weight tensor.
+            if instr.i_in == -1:
+                continue
             size = instr.path_shape[0] * instr.path_shape[1]
             block = linear.weight[offset : offset + size].reshape(instr.path_shape)
             blocks[idx] = block
@@ -99,6 +104,10 @@ class LoRAO3Linear(nn.Module):
 
         merged_blocks = []
         for base_idx, base_instr in enumerate(self.base.instructions):
+            # Bias instructions carry no LoRA delta and are absent from the
+            # weight blocks above; the bias is preserved untouched in self.base.bias.
+            if base_instr.i_in == -1:
+                continue
             i_in_base = base_instr.i_in
             i_out_base = base_instr.i_out
             pw_base = base_instr.path_weight
